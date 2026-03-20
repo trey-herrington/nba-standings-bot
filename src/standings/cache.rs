@@ -3,8 +3,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use chrono::NaiveDate;
-use tokio::sync::RwLock;
+use chrono::{Duration as ChronoDuration, NaiveDate};
+use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info};
 
 use crate::api::client::BallDontLieClient;
@@ -36,8 +36,15 @@ struct CacheInner {
 /// Stores teams and games in memory, supports incremental updates
 /// (only fetching games newer than what's already cached), and
 /// pre-computes standings so `/standings` responses are near-instant.
+///
+/// A `refresh_mutex` ensures that only one refresh runs at a time.
+/// If the pre-warm task, a `/standings` command, and the cron scheduler
+/// all try to refresh concurrently, only the first one does actual API
+/// work; the others wait for it to finish and use its result.
 pub struct StandingsCache {
     inner: RwLock<CacheInner>,
+    /// Serializes refresh operations so only one runs at a time.
+    refresh_mutex: Mutex<()>,
     api_client: Arc<BallDontLieClient>,
     season_override: Option<u32>,
 }
@@ -56,6 +63,7 @@ impl StandingsCache {
                 standings: None,
                 last_refresh: None,
             }),
+            refresh_mutex: Mutex::new(()),
             api_client,
             season_override,
         }
@@ -71,9 +79,7 @@ impl StandingsCache {
         // Fast path: check if cache is fresh under a read lock
         {
             let inner = self.inner.read().await;
-            if let (Some(standings), Some(last_refresh)) =
-                (&inner.standings, inner.last_refresh)
-            {
+            if let (Some(standings), Some(last_refresh)) = (&inner.standings, inner.last_refresh) {
                 if last_refresh.elapsed() < CACHE_TTL {
                     debug!(
                         "Cache hit: standings are {:.0}s old (TTL: {}s)",
@@ -93,7 +99,29 @@ impl StandingsCache {
     ///
     /// Returns the newly computed standings. This is called by the daily
     /// scheduler and when the cache TTL expires.
+    ///
+    /// Only one refresh runs at a time. If another task is already refreshing,
+    /// this call waits for it to finish and then returns the cached result
+    /// rather than starting a second concurrent refresh.
     pub async fn refresh(&self) -> Result<Standings> {
+        // Serialize refreshes: only one runs at a time
+        let _refresh_guard = self.refresh_mutex.lock().await;
+
+        // After acquiring the lock, check if someone else already refreshed
+        // while we were waiting. If so, their result is fresh enough.
+        {
+            let inner = self.inner.read().await;
+            if let (Some(standings), Some(last_refresh)) = (&inner.standings, inner.last_refresh) {
+                if last_refresh.elapsed() < CACHE_TTL {
+                    debug!(
+                        "Cache was refreshed while waiting for lock ({:.0}s old), using cached result",
+                        last_refresh.elapsed().as_secs_f64()
+                    );
+                    return Ok(standings.clone());
+                }
+            }
+        }
+
         let season = self.season_override.unwrap_or_else(current_nba_season);
 
         // Determine if this is a full or incremental fetch
@@ -115,10 +143,28 @@ impl StandingsCache {
             self.inner.read().await.teams.clone()
         };
 
-        // Fetch games: incremental if we have a latest date and same season
+        // Fetch games: incremental if we have a latest date and same season.
+        // Offset start_date by +1 day so we don't re-fetch the full page of
+        // games from the last known date (the HashMap deduplicates, but this
+        // avoids a wasted API page when the last date had many games).
         let new_games = if let (Some(ref date), false) = (&start_date, season_changed) {
-            info!("Incremental refresh: fetching games since {date}");
-            self.api_client.get_games_since(season, Some(date)).await?
+            let incremental_start = NaiveDate::parse_from_str(date, "%Y-%m-%d")
+                .ok()
+                .map(|d| (d + ChronoDuration::days(1)).format("%Y-%m-%d").to_string());
+
+            match incremental_start {
+                Some(ref next_day) => {
+                    info!("Incremental refresh: fetching games since {next_day}");
+                    self.api_client
+                        .get_games_since(season, Some(next_day))
+                        .await?
+                }
+                None => {
+                    // Couldn't parse the stored date; fall back to using it as-is
+                    info!("Incremental refresh: fetching games since {date}");
+                    self.api_client.get_games_since(season, Some(date)).await?
+                }
+            }
         } else {
             info!("Full refresh: fetching all games for season {season}");
             self.api_client.get_season_games(season).await?
@@ -202,4 +248,522 @@ pub struct CacheStats {
     pub season: u32,
     pub latest_game_date: Option<String>,
     pub age_secs: Option<u64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::models::Team;
+
+    // ── Helpers ─────────────────────────────────────────────────────
+
+    fn mock_team(id: u64, name: &str, abbr: &str, conference: &str) -> Team {
+        Team {
+            id,
+            conference: conference.to_string(),
+            division: "Test".to_string(),
+            city: "Test City".to_string(),
+            name: name.to_string(),
+            full_name: format!("Test City {name}"),
+            abbreviation: abbr.to_string(),
+        }
+    }
+
+    fn teams_json(teams: &[Team]) -> String {
+        let data: Vec<String> = teams
+            .iter()
+            .map(|t| {
+                format!(
+                    r#"{{"id":{},"conference":"{}","division":"{}","city":"{}","name":"{}","full_name":"{}","abbreviation":"{}"}}"#,
+                    t.id, t.conference, t.division, t.city, t.name, t.full_name, t.abbreviation
+                )
+            })
+            .collect();
+        format!(r#"{{"data":[{}],"meta":{{}}}}"#, data.join(","))
+    }
+
+    fn games_json(games: &[serde_json::Value]) -> String {
+        let data = serde_json::Value::Array(games.to_vec());
+        format!(r#"{{"data":{},"meta":{{}}}}"#, data)
+    }
+
+    fn game_json(
+        id: u64,
+        home_team: &Team,
+        visitor_team: &Team,
+        home_score: u32,
+        visitor_score: u32,
+        date: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "date": date,
+            "season": 2025,
+            "status": "Final",
+            "period": 4,
+            "postseason": false,
+            "home_team_score": home_score,
+            "visitor_team_score": visitor_score,
+            "home_team": {
+                "id": home_team.id,
+                "conference": home_team.conference,
+                "division": home_team.division,
+                "city": home_team.city,
+                "name": home_team.name,
+                "full_name": home_team.full_name,
+                "abbreviation": home_team.abbreviation,
+            },
+            "visitor_team": {
+                "id": visitor_team.id,
+                "conference": visitor_team.conference,
+                "division": visitor_team.division,
+                "city": visitor_team.city,
+                "name": visitor_team.name,
+                "full_name": visitor_team.full_name,
+                "abbreviation": visitor_team.abbreviation,
+            }
+        })
+    }
+
+    fn make_cache(server_url: &str) -> StandingsCache {
+        let client =
+            BallDontLieClient::with_base_url("test-key".to_string(), server_url.to_string())
+                .unwrap();
+        StandingsCache::new(Arc::new(client), Some(2025))
+    }
+
+    // ── Cache creation ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn new_cache_is_empty() {
+        let client = BallDontLieClient::new("test".to_string()).unwrap();
+        let cache = StandingsCache::new(Arc::new(client), Some(2025));
+        let stats = cache.stats().await;
+        assert_eq!(stats.team_count, 0);
+        assert_eq!(stats.game_count, 0);
+        assert!(stats.age_secs.is_none());
+        assert!(stats.latest_game_date.is_none());
+        assert_eq!(stats.season, 2025);
+    }
+
+    #[tokio::test]
+    async fn new_cache_uses_season_override() {
+        let client = BallDontLieClient::new("test".to_string()).unwrap();
+        let cache = StandingsCache::new(Arc::new(client), Some(2020));
+        let stats = cache.stats().await;
+        assert_eq!(stats.season, 2020);
+    }
+
+    // ── Full refresh via mock server ────────────────────────────────
+
+    #[tokio::test]
+    async fn refresh_fetches_teams_and_games() {
+        let mut server = mockito::Server::new_async().await;
+        let celtics = mock_team(1, "Celtics", "BOS", "East");
+        let lakers = mock_team(2, "Lakers", "LAL", "West");
+
+        let teams_mock = server
+            .mock("GET", "/teams")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(teams_json(&[celtics.clone(), lakers.clone()]))
+            .create_async()
+            .await;
+
+        let game = game_json(100, &celtics, &lakers, 110, 95, "2025-11-01");
+        // A full refresh splits the season into 4 date ranges,
+        // so the /games endpoint is called once per range.
+        let games_mock = server
+            .mock("GET", "/games")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(games_json(&[game]))
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        let cache = make_cache(&server.url());
+        let standings = cache.refresh().await.unwrap();
+
+        assert_eq!(standings.eastern.len(), 1);
+        assert_eq!(standings.western.len(), 1);
+        assert_eq!(standings.eastern[0].team.abbreviation, "BOS");
+        assert_eq!(standings.eastern[0].wins, 1);
+        assert_eq!(standings.western[0].team.abbreviation, "LAL");
+        assert_eq!(standings.western[0].losses, 1);
+
+        teams_mock.assert_async().await;
+        games_mock.assert_async().await;
+
+        let stats = cache.stats().await;
+        assert_eq!(stats.team_count, 2);
+        assert_eq!(stats.game_count, 1);
+        assert_eq!(stats.latest_game_date, Some("2025-11-01".to_string()));
+    }
+
+    // ── get_standings TTL: fresh cache returns instantly ─────────────
+
+    #[tokio::test]
+    async fn get_standings_returns_cached_when_fresh() {
+        let mut server = mockito::Server::new_async().await;
+        let celtics = mock_team(1, "Celtics", "BOS", "East");
+
+        let teams_mock = server
+            .mock("GET", "/teams")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(teams_json(&[celtics.clone()]))
+            .expect(1) // Should only be called once
+            .create_async()
+            .await;
+
+        let games_mock = server
+            .mock("GET", "/games")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(games_json(&[]))
+            .expect(4) // 4 date ranges on first full refresh
+            .create_async()
+            .await;
+
+        let cache = make_cache(&server.url());
+
+        // First call triggers refresh
+        let _ = cache.get_standings().await.unwrap();
+
+        // Second call should return cached (no new API calls)
+        let _ = cache.get_standings().await.unwrap();
+
+        teams_mock.assert_async().await;
+        games_mock.assert_async().await;
+    }
+
+    // ── Game upsert: same ID updates scores ─────────────────────────
+
+    #[tokio::test]
+    async fn refresh_upserts_games_by_id() {
+        let mut server = mockito::Server::new_async().await;
+        let celtics = mock_team(1, "Celtics", "BOS", "East");
+        let lakers = mock_team(2, "Lakers", "LAL", "West");
+
+        server
+            .mock("GET", "/teams")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(teams_json(&[celtics.clone(), lakers.clone()]))
+            .create_async()
+            .await;
+
+        // First refresh: game in-progress (no winner yet)
+        let game_v1 = serde_json::json!({
+            "id": 100,
+            "date": "2025-11-01",
+            "season": 2025,
+            "status": "3rd Qtr",
+            "period": 3,
+            "postseason": false,
+            "home_team_score": 80,
+            "visitor_team_score": 75,
+            "home_team": {
+                "id": 1, "conference": "East", "division": "Test",
+                "city": "Test City", "name": "Celtics",
+                "full_name": "Test City Celtics", "abbreviation": "BOS"
+            },
+            "visitor_team": {
+                "id": 2, "conference": "West", "division": "Test",
+                "city": "Test City", "name": "Lakers",
+                "full_name": "Test City Lakers", "abbreviation": "LAL"
+            }
+        });
+
+        server
+            .mock("GET", "/games")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(games_json(&[game_v1]))
+            .create_async()
+            .await;
+
+        let cache = make_cache(&server.url());
+        let standings = cache.refresh().await.unwrap();
+
+        // Game not final, so no wins/losses
+        assert_eq!(standings.eastern[0].wins, 0);
+        assert_eq!(standings.eastern[0].losses, 0);
+
+        let stats = cache.stats().await;
+        assert_eq!(stats.game_count, 1);
+
+        // Second refresh: same game ID, now Final
+        server.reset();
+
+        // Teams already cached, so won't be re-fetched (same season)
+        let game_v2 = game_json(100, &celtics, &lakers, 110, 95, "2025-11-01");
+        server
+            .mock("GET", "/games")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(games_json(&[game_v2]))
+            .create_async()
+            .await;
+
+        // Manually expire the cache to force a refresh
+        {
+            let mut inner = cache.inner.write().await;
+            inner.last_refresh =
+                Some(std::time::Instant::now() - Duration::from_secs(CACHE_TTL.as_secs() + 1));
+        }
+
+        let standings = cache.refresh().await.unwrap();
+
+        // Now the game is Final, BOS should have 1 win
+        let bos = standings
+            .eastern
+            .iter()
+            .find(|r| r.team.abbreviation == "BOS")
+            .unwrap();
+        assert_eq!(bos.wins, 1);
+        assert_eq!(bos.losses, 0);
+
+        // Still only 1 game (upserted, not duplicated)
+        let stats = cache.stats().await;
+        assert_eq!(stats.game_count, 1);
+    }
+
+    // ── Latest game date tracking ───────────────────────────────────
+
+    #[tokio::test]
+    async fn refresh_tracks_latest_game_date() {
+        let mut server = mockito::Server::new_async().await;
+        let celtics = mock_team(1, "Celtics", "BOS", "East");
+        let lakers = mock_team(2, "Lakers", "LAL", "West");
+
+        server
+            .mock("GET", "/teams")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(teams_json(&[celtics.clone(), lakers.clone()]))
+            .create_async()
+            .await;
+
+        let games = vec![
+            game_json(100, &celtics, &lakers, 110, 95, "2025-11-01"),
+            game_json(101, &celtics, &lakers, 105, 100, "2025-12-15"),
+            game_json(102, &celtics, &lakers, 120, 90, "2025-11-20"),
+        ];
+
+        server
+            .mock("GET", "/games")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(games_json(&games))
+            .create_async()
+            .await;
+
+        let cache = make_cache(&server.url());
+        cache.refresh().await.unwrap();
+
+        let stats = cache.stats().await;
+        assert_eq!(
+            stats.latest_game_date,
+            Some("2025-12-15".to_string()),
+            "Should track the latest date across all games"
+        );
+    }
+
+    // ── Refresh mutex: concurrent refreshes coalesce ────────────────
+
+    #[tokio::test]
+    async fn concurrent_refreshes_coalesce() {
+        let mut server = mockito::Server::new_async().await;
+        let celtics = mock_team(1, "Celtics", "BOS", "East");
+
+        let teams_mock = server
+            .mock("GET", "/teams")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(teams_json(&[celtics.clone()]))
+            .expect(1) // Should only be called once despite 3 concurrent refreshes
+            .create_async()
+            .await;
+
+        let games_mock = server
+            .mock("GET", "/games")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(games_json(&[]))
+            .expect(4) // 4 date ranges, only from the first refresh
+            .create_async()
+            .await;
+
+        let cache = Arc::new(make_cache(&server.url()));
+
+        // Spawn 3 concurrent refreshes
+        let mut handles = Vec::new();
+        for _ in 0..3 {
+            let cache = cache.clone();
+            handles.push(tokio::spawn(async move { cache.refresh().await }));
+        }
+
+        // All should succeed
+        for handle in handles {
+            let result = handle.await.unwrap();
+            assert!(result.is_ok());
+        }
+
+        // Only 1 teams call and 4 game calls total (not 3x)
+        teams_mock.assert_async().await;
+        games_mock.assert_async().await;
+    }
+
+    // ── Incremental refresh uses +1 day offset ──────────────────────
+
+    #[tokio::test]
+    async fn incremental_refresh_offsets_start_date() {
+        let mut server = mockito::Server::new_async().await;
+        let celtics = mock_team(1, "Celtics", "BOS", "East");
+        let lakers = mock_team(2, "Lakers", "LAL", "West");
+
+        // First full refresh
+        server
+            .mock("GET", "/teams")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(teams_json(&[celtics.clone(), lakers.clone()]))
+            .create_async()
+            .await;
+
+        let game = game_json(100, &celtics, &lakers, 110, 95, "2025-11-15");
+        server
+            .mock("GET", "/games")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(games_json(&[game]))
+            .create_async()
+            .await;
+
+        let cache = make_cache(&server.url());
+        cache.refresh().await.unwrap();
+
+        let stats = cache.stats().await;
+        assert_eq!(stats.latest_game_date, Some("2025-11-15".to_string()));
+
+        // Reset the server for incremental refresh
+        server.reset();
+
+        // The incremental refresh should use start_date = 2025-11-16 (latest + 1)
+        let incremental_games_mock = server
+            .mock("GET", "/games")
+            .match_query(mockito::Matcher::AllOf(vec![mockito::Matcher::UrlEncoded(
+                "start_date".to_string(),
+                "2025-11-16".to_string(),
+            )]))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(games_json(&[]))
+            .create_async()
+            .await;
+
+        // Expire the cache to trigger refresh
+        {
+            let mut inner = cache.inner.write().await;
+            inner.last_refresh =
+                Some(std::time::Instant::now() - Duration::from_secs(CACHE_TTL.as_secs() + 1));
+        }
+
+        cache.refresh().await.unwrap();
+
+        incremental_games_mock.assert_async().await;
+    }
+
+    // ── Cache stats ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn stats_reports_age_after_refresh() {
+        let mut server = mockito::Server::new_async().await;
+        let celtics = mock_team(1, "Celtics", "BOS", "East");
+
+        server
+            .mock("GET", "/teams")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(teams_json(&[celtics]))
+            .create_async()
+            .await;
+
+        server
+            .mock("GET", "/games")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(games_json(&[]))
+            .create_async()
+            .await;
+
+        let cache = make_cache(&server.url());
+        cache.refresh().await.unwrap();
+
+        let stats = cache.stats().await;
+        assert!(stats.age_secs.is_some());
+        assert!(stats.age_secs.unwrap() < 5, "Cache should be very fresh");
+    }
+
+    // ── API error propagation ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn refresh_propagates_teams_api_error() {
+        let mut server = mockito::Server::new_async().await;
+
+        // Teams endpoint returns 500
+        server
+            .mock("GET", "/teams")
+            .with_status(500)
+            .with_body("Internal Server Error")
+            .create_async()
+            .await;
+
+        let cache = make_cache(&server.url());
+        let result = cache.refresh().await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("500"),
+            "Expected error to mention 500, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_propagates_games_api_error() {
+        let mut server = mockito::Server::new_async().await;
+        let celtics = mock_team(1, "Celtics", "BOS", "East");
+
+        server
+            .mock("GET", "/teams")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(teams_json(&[celtics]))
+            .create_async()
+            .await;
+
+        server
+            .mock("GET", "/games")
+            .match_query(mockito::Matcher::Any)
+            .with_status(500)
+            .with_body("Internal Server Error")
+            .create_async()
+            .await;
+
+        let cache = make_cache(&server.url());
+        let result = cache.refresh().await;
+
+        assert!(result.is_err());
+    }
 }
