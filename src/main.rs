@@ -111,10 +111,7 @@ async fn main() -> Result<()> {
                     }
                 }
 
-                Ok(Data {
-                    cache,
-                    config,
-                })
+                Ok(Data { cache, config })
             })
         })
         .build();

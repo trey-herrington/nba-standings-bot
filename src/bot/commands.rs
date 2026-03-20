@@ -35,8 +35,11 @@ pub async fn standings(
     // TODO: if a non-default season is requested, we'd need a separate
     // cache or a direct fetch. For now, the cache serves the current season.
     if season.is_some() && season != ctx.data().config.nba_season {
-        ctx.say("Custom season lookups bypass the cache and may take a few minutes. \
-                 Fetching...").await?;
+        ctx.say(
+            "Custom season lookups bypass the cache and may take a few minutes. \
+                 Fetching...",
+        )
+        .await?;
     }
 
     match ctx.data().cache.get_standings().await {

@@ -43,3 +43,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Error handling
 anyhow = "1"
+
+[dev-dependencies]
+mockito = "1"
+tokio = { version = "1", features = ["full", "test-util"] }
