@@ -12,9 +12,13 @@ primary_region = 'dfw'
 RUST_LOG = 'info'
 
 # No [http_service] — this is a long-running Discord bot, not an HTTP server.
-# Fly.io will keep the machine running continuously without autostop.
+# The [deploy] section ensures the machine stays running continuously.
+
+[deploy]
+auto_stop_machines = false
+auto_start_machines = false
+min_machines_count = 1
 
 [[vm]]
 memory = '256mb'
 cpus = 1
-memory_mb = 256
