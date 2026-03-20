@@ -9,9 +9,10 @@ use super::models::{ApiResponse, Game, Team};
 const BASE_URL: &str = "https://api.balldontlie.io/v1";
 
 /// Rate limit: free tier allows 5 requests per minute.
-/// We send up to 5 requests concurrently, then wait for the remainder
-/// of the 60-second window before the next batch.
-const RATE_LIMIT_BATCH_SIZE: usize = 5;
+/// We send up to 4 game requests concurrently, reserving 1 slot for the
+/// get_teams() call that precedes game fetching. We then wait for the
+/// remainder of the 60-second window before the next batch.
+const RATE_LIMIT_BATCH_SIZE: usize = 4;
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(61);
 
 /// Maximum results per page (API max is 100).
@@ -193,7 +194,10 @@ impl BallDontLieClient {
         Ok(all_games)
     }
 
-    /// Fetch a single page of games for a date range.
+    /// Maximum number of retry attempts when the API returns 429 Too Many Requests.
+    const MAX_RETRIES: u32 = 5;
+
+    /// Fetch a single page of games for a date range, retrying on 429.
     /// Returns the games and the next cursor (None if no more pages).
     async fn fetch_games_page(
         &self,
@@ -202,56 +206,78 @@ impl BallDontLieClient {
         end_date: &str,
         cursor: Option<u64>,
     ) -> Result<(Vec<Game>, Option<u64>)> {
-        let mut request = self
-            .client
-            .get(format!("{BASE_URL}/games"))
-            .header("Authorization", &self.api_key)
-            .query(&[
-                ("seasons[]", season.to_string()),
-                ("postseason", "false".to_string()),
-                ("per_page", PER_PAGE.to_string()),
-                ("start_date", start_date.to_string()),
-                ("end_date", end_date.to_string()),
-            ]);
+        let mut attempt = 0u32;
 
-        if let Some(c) = cursor {
-            request = request.query(&[("cursor", c.to_string())]);
-        }
+        loop {
+            let mut request = self
+                .client
+                .get(format!("{BASE_URL}/games"))
+                .header("Authorization", &self.api_key)
+                .query(&[
+                    ("seasons[]", season.to_string()),
+                    ("postseason", "false".to_string()),
+                    ("per_page", PER_PAGE.to_string()),
+                    ("start_date", start_date.to_string()),
+                    ("end_date", end_date.to_string()),
+                ]);
 
-        let resp = request
-            .send()
-            .await
-            .with_context(|| {
-                format!("Failed to fetch games ({start_date} to {end_date})")
+            if let Some(c) = cursor {
+                request = request.query(&[("cursor", c.to_string())]);
+            }
+
+            let resp = request
+                .send()
+                .await
+                .with_context(|| {
+                    format!("Failed to fetch games ({start_date} to {end_date})")
+                })?;
+
+            let status = resp.status();
+
+            // Retry on 429 with exponential backoff
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                attempt += 1;
+                if attempt > Self::MAX_RETRIES {
+                    anyhow::bail!(
+                        "Games API rate limited after {attempt} retries ({start_date} to {end_date})"
+                    );
+                }
+                let backoff = Duration::from_secs(RATE_LIMIT_WINDOW.as_secs() * u64::from(attempt));
+                warn!(
+                    "Rate limited (429), retry {attempt}/{} in {backoff:?} ({start_date} to {end_date})",
+                    Self::MAX_RETRIES
+                );
+                tokio::time::sleep(backoff).await;
+                continue;
+            }
+
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                anyhow::bail!(
+                    "Games API returned {status} ({start_date} to {end_date}): {body}"
+                );
+            }
+
+            let api_resp: ApiResponse<Game> = resp.json().await.with_context(|| {
+                format!("Failed to parse games response ({start_date} to {end_date})")
             })?;
 
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!(
-                "Games API returned {status} ({start_date} to {end_date}): {body}"
+            let next_cursor = api_resp.meta.and_then(|m| m.next_cursor);
+            let count = api_resp.data.len();
+            debug!(
+                "Fetched {count} games for {start_date}..{end_date} (cursor: {cursor:?}, next: {next_cursor:?})"
             );
+
+            return Ok((api_resp.data, next_cursor));
         }
-
-        let api_resp: ApiResponse<Game> = resp.json().await.with_context(|| {
-            format!("Failed to parse games response ({start_date} to {end_date})")
-        })?;
-
-        let next_cursor = api_resp.meta.and_then(|m| m.next_cursor);
-        let count = api_resp.data.len();
-        debug!(
-            "Fetched {count} games for {start_date}..{end_date} (cursor: {cursor:?}, next: {next_cursor:?})"
-        );
-
-        Ok((api_resp.data, next_cursor))
     }
 }
 
-/// Split an NBA season into 5 roughly equal date ranges for parallel fetching.
+/// Split an NBA season into date ranges for parallel fetching.
 ///
 /// A typical NBA season runs from mid-October to mid-April (~180 game days).
-/// We split this into 5 ranges so we can fetch the first page of each
-/// concurrently within a single rate-limit window.
+/// We split this into RATE_LIMIT_BATCH_SIZE ranges so we can fetch the first
+/// page of each concurrently within a single rate-limit window.
 fn season_date_ranges(season: u32) -> Vec<(String, String)> {
     let start = NaiveDate::from_ymd_opt(season as i32, 10, 1)
         .expect("valid season start date");
@@ -287,28 +313,3 @@ fn season_date_ranges(season: u32) -> Vec<(String, String)> {
     ranges
 }
 
-/// Retry a request up to `max_retries` times with exponential backoff.
-#[allow(dead_code)]
-pub async fn retry_on_rate_limit<F, Fut, T>(max_retries: u32, mut f: F) -> Result<T>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<T>>,
-{
-    let mut attempt = 0;
-    loop {
-        match f().await {
-            Ok(val) => return Ok(val),
-            Err(e) => {
-                attempt += 1;
-                if attempt >= max_retries {
-                    return Err(e);
-                }
-                let backoff = Duration::from_secs(2u64.pow(attempt));
-                warn!(
-                    "Request failed (attempt {attempt}/{max_retries}), retrying in {backoff:?}: {e}"
-                );
-                tokio::time::sleep(backoff).await;
-            }
-        }
-    }
-}

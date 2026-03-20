@@ -19,7 +19,7 @@ fn build_table(records: &[TeamRecord]) -> String {
         "{:<4} {:<4} {:>3} {:>3}  {:>5}",
         "#", "Team", "W", "L", "PCT"
     ));
-    lines.push(format!("{}", "─".repeat(24)));
+    lines.push("─".repeat(24));
 
     // Team rows
     for (i, record) in records.iter().enumerate() {
