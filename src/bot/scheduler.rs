@@ -139,7 +139,9 @@ mod tests {
         // Serialize the CreateMessage to JSON so we can inspect the embeds array.
         // CreateMessage derives Serialize, so this gives us the wire format.
         let json = serde_json::to_value(&message).expect("message should serialize");
-        let embeds = json["embeds"].as_array().expect("embeds should be an array");
+        let embeds = json["embeds"]
+            .as_array()
+            .expect("embeds should be an array");
 
         assert_eq!(
             embeds.len(),
@@ -148,10 +150,7 @@ mod tests {
             embeds.len()
         );
 
-        let titles: Vec<&str> = embeds
-            .iter()
-            .filter_map(|e| e["title"].as_str())
-            .collect();
+        let titles: Vec<&str> = embeds.iter().filter_map(|e| e["title"].as_str()).collect();
 
         assert!(
             titles.iter().any(|t| t.contains("Eastern")),
@@ -203,7 +202,9 @@ mod tests {
 
         let message = build_standings_message(&standings);
         let json = serde_json::to_value(&message).expect("message should serialize");
-        let embeds = json["embeds"].as_array().expect("embeds should be an array");
+        let embeds = json["embeds"]
+            .as_array()
+            .expect("embeds should be an array");
 
         assert_eq!(
             embeds.len(),
@@ -228,7 +229,11 @@ mod tests {
         };
 
         let embeds = build_standings_embeds(&standings);
-        assert_eq!(embeds.len(), 2, "build_standings_embeds should return 2 embeds");
+        assert_eq!(
+            embeds.len(),
+            2,
+            "build_standings_embeds should return 2 embeds"
+        );
 
         // Demonstrate the bug: the old code used .embed() in a loop, which
         // replaces rather than appends in serenity's CreateMessage.
@@ -244,7 +249,10 @@ mod tests {
             "The old .embed() loop should produce only 1 embed (the bug)"
         );
         assert!(
-            buggy_embeds[0]["title"].as_str().unwrap().contains("Western"),
+            buggy_embeds[0]["title"]
+                .as_str()
+                .unwrap()
+                .contains("Western"),
             "The old .embed() loop should only keep the last (Western) embed"
         );
 
@@ -258,11 +266,17 @@ mod tests {
             "The fixed .embeds() call must preserve both conference embeds"
         );
         assert!(
-            fixed_embeds[0]["title"].as_str().unwrap().contains("Eastern"),
+            fixed_embeds[0]["title"]
+                .as_str()
+                .unwrap()
+                .contains("Eastern"),
             "First embed should be Eastern Conference"
         );
         assert!(
-            fixed_embeds[1]["title"].as_str().unwrap().contains("Western"),
+            fixed_embeds[1]["title"]
+                .as_str()
+                .unwrap()
+                .contains("Western"),
             "Second embed should be Western Conference"
         );
     }
