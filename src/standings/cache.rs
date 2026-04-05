@@ -191,15 +191,23 @@ impl StandingsCache {
                 .and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok());
 
             for game in new_games {
-                if let Ok(game_date) = NaiveDate::parse_from_str(&game.date, "%Y-%m-%d") {
-                    match &latest_date {
-                        Some(current) if game_date > *current => {
-                            latest_date = Some(game_date);
+                // Only advance latest_game_date for completed games so that
+                // incremental refreshes start from the day after the last
+                // *finished* game, not the last *scheduled* one. Without this,
+                // the initial full fetch picks up future-dated scheduled games,
+                // pushing the incremental start_date past today and causing
+                // every subsequent refresh to return 0 results.
+                if game.status == "Final" {
+                    if let Ok(game_date) = NaiveDate::parse_from_str(&game.date, "%Y-%m-%d") {
+                        match &latest_date {
+                            Some(current) if game_date > *current => {
+                                latest_date = Some(game_date);
+                            }
+                            None => {
+                                latest_date = Some(game_date);
+                            }
+                            _ => {}
                         }
-                        None => {
-                            latest_date = Some(game_date);
-                        }
-                        _ => {}
                     }
                 }
                 inner.games.insert(game.id, game);
@@ -681,6 +689,71 @@ mod tests {
         cache.refresh().await.unwrap();
 
         incremental_games_mock.assert_async().await;
+    }
+
+    // ── Scheduled games don't advance latest_game_date ────────────
+
+    #[tokio::test]
+    async fn scheduled_games_do_not_advance_latest_game_date() {
+        let mut server = mockito::Server::new_async().await;
+        let celtics = mock_team(1, "Celtics", "BOS", "East");
+        let lakers = mock_team(2, "Lakers", "LAL", "West");
+
+        server
+            .mock("GET", "/teams")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(teams_json(&[celtics.clone(), lakers.clone()]))
+            .create_async()
+            .await;
+
+        // Mix of Final and Scheduled games. The scheduled game has a
+        // later date but should NOT move latest_game_date forward.
+        let final_game = game_json(100, &celtics, &lakers, 110, 95, "2025-11-15");
+        let scheduled_game = serde_json::json!({
+            "id": 200,
+            "date": "2026-03-20",
+            "season": 2025,
+            "status": "8:00 pm ET",
+            "period": 0,
+            "postseason": false,
+            "home_team_score": null,
+            "visitor_team_score": null,
+            "home_team": {
+                "id": 1, "conference": "East", "division": "Test",
+                "city": "Test City", "name": "Celtics",
+                "full_name": "Test City Celtics", "abbreviation": "BOS"
+            },
+            "visitor_team": {
+                "id": 2, "conference": "West", "division": "Test",
+                "city": "Test City", "name": "Lakers",
+                "full_name": "Test City Lakers", "abbreviation": "LAL"
+            }
+        });
+
+        server
+            .mock("GET", "/games")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(games_json(&[final_game, scheduled_game]))
+            .create_async()
+            .await;
+
+        let cache = make_cache(&server.url());
+        cache.refresh().await.unwrap();
+
+        let stats = cache.stats().await;
+        // latest_game_date should be the Final game's date, not the
+        // scheduled game's far-future date.
+        assert_eq!(
+            stats.latest_game_date,
+            Some("2025-11-15".to_string()),
+            "Scheduled games must not advance latest_game_date"
+        );
+        // Both games should still be in the cache (for standings
+        // computation, even though only Final ones count).
+        assert_eq!(stats.game_count, 2);
     }
 
     // ── Cache stats ─────────────────────────────────────────────────
